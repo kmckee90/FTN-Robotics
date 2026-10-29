@@ -1,0 +1,16 @@
+[project]
+name = "ftn-metaworld-bc"
+version = "0.1.0"
+description = "Self-contained MT50 sequential and MT10 parallel-segment behavior cloning experiments"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "torch==2.4.0",
+    "numpy==1.26.4",
+    "matplotlib==3.9.2",
+    "pillow>=10",
+    "metaworld==3.0.0",
+    "mujoco==3.10.0",  # MetaWorld 3.0 uses the pre-3.17 weld layout.
+]
+
+[tool.uv]
+package = false

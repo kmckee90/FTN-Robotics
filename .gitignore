@@ -1,0 +1,9 @@
+**/artifacts/
+data_cache/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+MUJOCO_LOG.TXT
+.DS_Store
