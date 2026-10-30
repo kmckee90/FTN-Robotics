@@ -11,30 +11,32 @@ import random
 import time
 import numpy as np
 import torch
+from models import ModelConfig, reactive_enabled
 from runtime import run_cli, validate_config, configure_runtime
 import csv
 import metaworld
 from bc import BCAgent, SupportArchive, disjoint_task_mask, eval_task, eval_prior_task, make_support, save_checkpoint
-from data import StandardTaskEnv, fit_normalizer, generate_or_load_demos
+from data import DEFAULT_DATA_DIR, StandardTaskEnv, fit_normalizer, generate_or_load_demos
 from visualization import plot_matrix
 
 DEFAULT_TASKS = ('reach-v3', 'push-v3', 'door-open-v3', 'drawer-open-v3', 'drawer-close-v3', 'button-press-topdown-v3', 'window-open-v3', 'window-close-v3') + tuple(sorted(set(metaworld.ALL_V3_ENVIRONMENTS) - set(('reach-v3', 'push-v3', 'door-open-v3', 'drawer-open-v3', 'drawer-close-v3', 'button-press-topdown-v3', 'window-open-v3', 'window-close-v3'))))
 
 @dataclass
-class ExpertBCConfig:
+class ExpertBCConfig(ModelConfig):
 
     # Tasks and execution
     tasks: tuple = DEFAULT_TASKS
+    num_tasks: int | None = None  # Use tasks[:num_tasks]; None keeps all configured tasks.
     seed: int = 0
     device: str = "auto"  # CUDA when available, otherwise CPU
     num_threads: int = 3
     output_path: str = ""
-    data_dir: str = str(ROOT / "data_cache")
+    data_dir: str = DEFAULT_DATA_DIR
     log_every: int = 5
 
     # Scripted-expert demonstrations
     n_demos: int = 250
-    demo_max_steps: int = 500
+    demo_max_steps: int = 400
     demo_tail: int = 100
 
     # Behavior cloning
@@ -45,42 +47,15 @@ class ExpertBCConfig:
     eval_episodes: int = 4
     eval_max_steps: int = 500
 
-    # FTN backbone
-    ftn_hidden_size: int = 48 * 48
-    ftn_k: int = 256
-    ftn_inner_size: int = 8
-    ftn_layers: int = 8
-    ftn_dropout_p: float = 0.0
-
-    # Spatial mask smoothing
-    ftn_square_dim: int = 48
-    lateral_steps: int = 0
-    lateral_polyak: float = 1.0
-    lateral_kernel: int = 3
-    lateral_noise_sd: float = 0.0
-    lateral_torus: bool = False
+    # Checkpoints
     ckpt_path: str = ""
     kt_dir: str = "checkpoints"
 
     # AnnealedSTE mask search
-    reconfig_steps: int = 30
     eval_reconfig_steps: int | None = 60
-    reconfig_lr: float = 0.3
     reconfig_n: int = 4096
-    mask_init_noise_scale: float = 1e-05
-    mask_warm_start: bool = False
     reconfig_train: int = 10
     reconfig_eval: int = 0
-    consolidate: bool = True
-
-    # Cross-task consolidation
-    replay_max_chunks: int = 4
-    replay_max_tuples: int = 1024
-    rho_low: float = 0.2
-    rho_high: float = 0.8
-    fixed_mask: bool = False
-    no_mask: bool = False
-    stored_mask: bool = False
 
     # Artifact destination
     artifact_root: str = str(Path(__file__).resolve().parent / "artifacts")
@@ -89,7 +64,6 @@ def smoke_config() -> ExpertBCConfig:
     return ExpertBCConfig(
         tasks=("drawer-open-v3", "drawer-close-v3"),
         n_demos=5,
-        demo_max_steps=200,
         bc_epochs=5,
         eval_episodes=3,
         eval_max_steps=200,
@@ -213,7 +187,7 @@ def _train_envs(cfg, envs):
             f"N={N}, k={cfg.ftn_k}, H={cfg.ftn_hidden_size}"
         )
 
-    print("Generating / loading expert demonstrations...")
+    print("Loading shared expert demonstrations...")
     demos = generate_or_load_demos(envs, cfg)
     obs_mean, obs_std = fit_normalizer(demos)
 
@@ -262,10 +236,12 @@ def _train_envs(cfg, envs):
         n_trans = obs_full.shape[0]
 
         # 1) Mask reconfig on the expert support (FTN / stored-mask only) ----
-        if not no_reconfig:
+        if not no_reconfig and not reactive_enabled(cfg):
             s_obs, s_act = make_support(demo, agent, cfg.reconfig_n)
             _, stats = agent.reconfig_actor_mask(s_obs, s_act, commit=True)
             print(f"  reconfig: BC {stats['bc_init']:.4f} -> {stats['bc_final']:.4f}")
+        elif not no_reconfig:
+            print("  reactive inference: update on minibatches without task-boundary resets")
         else:
             print(f"  {baseline_label} baseline: skipping reconfig")
         agent.stored_m_a[ti] = agent.m_a.detach().clone()
@@ -283,9 +259,9 @@ def _train_envs(cfg, envs):
                 # minibatch (warm-started from the running logits) before the
                 # step. reconfig_train=0 disables it (mask frozen post phase-start).
                 if (
-                    cfg.reconfig_train >= 1
-                    and not no_reconfig
-                    and batch_ctr % cfg.reconfig_train == 0
+                    not no_reconfig
+                    and (reactive_enabled(cfg) or (
+                        cfg.reconfig_train >= 1 and batch_ctr % cfg.reconfig_train == 0))
                 ):
                     agent.reconfig_actor_mask(
                         obs_full[bidx], act_full[bidx], commit=True

@@ -1,0 +1,3 @@
+# Legacy demonstration caches must never sync in either direction.
+data_cache/
+**/data_cache/

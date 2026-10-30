@@ -1,0 +1,40 @@
+# Portable model preset for either MT50 or MT10. Explicit CLI flags win.
+# MT10 disables archive-based replay and keeps its segment co-training semantics.
+# Upstream Reactive_Low + NoReplay: SD=5, EMA=0.9, no support replay.
+model: ftn
+ftn_hidden_size: 2304
+ftn_k: 256
+ftn_inner_size: 8
+ftn_layers: 8
+ftn_dropout_p: 0.0
+ftn_square_dim: 48
+lateral_steps: 0
+lateral_polyak: 1.0
+lateral_kernel: 3
+lateral_noise_sd: 0.0
+lateral_torus: false
+reconfig_steps: 30
+reconfig_lr: 0.3
+mask_init_noise_scale: 0.00001
+mask_warm_start: false
+no_mask: false
+fixed_mask: false
+stored_mask: false
+consolidate: false
+replay_max_chunks: 0
+replay_max_tuples: 1024
+rho_low: 0.2
+rho_high: 0.8
+reconfig_noise_scale: 1.0
+reconfig_overlap_mode: bump
+reconfig_overlap_lambda: 0.0
+reconfig_overlap_threshold: 0.5
+reconfig_overlap_temperature: 0.2
+reconfig_reactive: true
+reconfig_reactive_sd: 5.0
+reconfig_reactive_ema: 0.9
+eval_reconfig_lr: 0.3
+eval_reconfig_sample_size: null
+eval_reconfig_temperature: 1.0
+eval_reconfig_restarts: 1
+eval_reconfig_take_best: false

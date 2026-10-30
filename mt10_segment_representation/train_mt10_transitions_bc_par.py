@@ -11,24 +11,24 @@ import random
 import time
 import numpy as np
 import torch
+from models import ModelConfig, model_name, reactive_enabled
 from runtime import run_cli, validate_config, configure_runtime
-import torch.nn.functional as F
-from ftn import anneal_ste_mask_batched
+from models import anneal_ste_mask_batched
 from bc import BCAgent, save_checkpoint
-from data import build_envs, fit_normalizer, generate_or_load_trajectories, segment_windows
+from data import DEFAULT_DATA_DIR, build_envs, fit_normalizer, generate_or_load_trajectories, segment_windows
 from visualization import plot_losses
 
 DEFAULT_TASKS = ('reach-v3', 'push-v3', 'door-open-v3', 'drawer-open-v3', 'drawer-close-v3', 'button-press-topdown-v3', 'window-open-v3', 'window-close-v3', 'peg-insert-side-v3', 'pick-place-v3')
 
 @dataclass
-class ParSegmentBCConfig:
+class ParSegmentBCConfig(ModelConfig):
 
     # Tasks and execution
     tasks: tuple = DEFAULT_TASKS
     seed: int = 0
     device: str = "auto"  # CUDA when available, otherwise CPU
     num_threads: int = 3
-    data_dir: str = str(ROOT / "data_cache")
+    data_dir: str = DEFAULT_DATA_DIR
     log_every: int = 5
 
     # Scripted-expert demonstrations
@@ -40,28 +40,17 @@ class ParSegmentBCConfig:
     bc_lr: float = 0.0003
     weight_decay: float = 0.0
 
-    # FTN backbone
+    # Legacy experiment defaults when no model YAML is supplied.
     ftn_hidden_size: int = 1024
     ftn_k: int = 64
-    ftn_inner_size: int = 8
-    ftn_layers: int = 8
-    ftn_dropout_p: float = 0.0
 
     # Spatial mask smoothing
     ftn_square_dim: int = 32
-    lateral_steps: int = 0
     lateral_polyak: float = 0.9
     lateral_kernel: int = 5
-    lateral_noise_sd: float = 0.0
-    lateral_torus: bool = False
 
-    # AnnealedSTE mask search
-    reconfig_steps: int = 30
-    reconfig_lr: float = 0.3
-    mask_init_noise_scale: float = 1e-05
+    # Segment warm starts
     mask_warm_start: bool = True
-    fixed_mask: bool = False
-    no_mask: bool = False
 
     # Parallel segment training
     segment_length: int = 4
@@ -81,7 +70,6 @@ def smoke_config() -> ParSegmentBCConfig:
     return ParSegmentBCConfig(
         tasks=("drawer-open-v3",),
         n_demos=3,
-        demo_max_steps=200,
         ftn_hidden_size=64,
         ftn_k=16,
         ftn_inner_size=4,
@@ -103,14 +91,9 @@ def batched_actor(actor, obs_b: torch.Tensor, masks: torch.Tensor) -> torch.Tens
     masks : (S, H)    — one k-hot (or STE soft) mask per segment.
     returns (S, L, A) actions.
 
-    Exploits that z = ParallelMLP(obs) is mask-independent: one forward over all
-    S*L observations, reshaped to (S, L, H), then gated per-segment by masks and
-    passed through the shared (bias-free) output linear + tanh."""
-    S, L, D = obs_b.shape
-    z = actor.parallel(obs_b.reshape(S * L, D))  # (S*L, H)
-    z = actor.dropout(z)
-    z = z.reshape(S, L, -1) * masks.unsqueeze(1)  # (S, L, H)
-    return torch.tanh(F.linear(z, actor.linear.weight))  # (S, L, A)
+    Dispatches to the backbone's batched implementation: FTN gates precomputed
+    features; LoRA applies each segment mask at every frozen-backbone layer."""
+    return actor.forward_batched(obs_b, masks)
 
 def batched_reconfig(
     agent: BCAgent,
@@ -118,20 +101,35 @@ def batched_reconfig(
     act_b: torch.Tensor,
     cfg: ParSegmentBCConfig,
     init_logits: torch.Tensor | None,
+    segment_ids=None,
 ):
-    """One batched AnnealedSTE search: recover an independent k-hot mask for each
+    """Configured inference: recover an independent k-hot mask for each
     of the S segments in the batch, against the current actor weights. Returns
     (masks (S,H) hard+smoothed, logits (S,H), bc_init, bc_final).
 
     The actor weights are frozen for the search (only the S mask-logit vectors
     are optimized), so no actor gradients are computed here."""
     H, k, S = cfg.ftn_hidden_size, cfg.ftn_k, obs_b.shape[0]
+    if model_name(cfg) != 'ftn' or reactive_enabled(cfg):
+        if segment_ids is None:
+            # Direct calls represent a stable batch; training always passes IDs.
+            if agent.inference.segment_state is None:
+                agent.inference.init_segments(S)
+            segment_ids = list(range(S))
+        masks, logits, stats = agent.inference.search(
+            obs_b, act_b, commit=True, ids=segment_ids, init_logits=init_logits,
+            stored=(torch.stack(list(agent.stored_m_a.values())) if agent.stored_m_a else None),
+        )
+        if not reactive_enabled(cfg) or (stats['steps'] > 0).any():
+            agent.reset_optimizer_state()
+        return masks, logits, float(stats['bc_init'].mean()), float(stats['bc_final'].mean())
 
     def loss_fn(soft_masks):  # soft_masks: (S, H) -> per-segment loss (S,)
         y = batched_actor(agent.actor, obs_b, soft_masks)
         return ((y - act_b) ** 2).mean(dim=(1, 2))
 
     # Freeze actor params so the search graph doesn't waste work on their grads.
+    flags = [p.requires_grad for p in agent.actor.parameters()]
     for p in agent.actor.parameters():
         p.requires_grad_(False)
     try:
@@ -146,12 +144,13 @@ def batched_reconfig(
             noise_scale=cfg.mask_init_noise_scale,
         )
     finally:
-        for p in agent.actor.parameters():
-            p.requires_grad_(True)
+        for p, flag in zip(agent.actor.parameters(), flags):
+            p.requires_grad_(flag)
 
     # Lateral spatial smoothing, per segment (no-op when smoothing is disabled).
     if agent.smoother.enabled:
         masks = torch.stack([agent.smoother.smooth(m) for m in masks])
+    agent.reset_optimizer_state()
     return masks, logits, l0, l1
 
 def batched_bc_step(agent: BCAgent, obs_b, act_b, masks) -> float:
@@ -163,7 +162,8 @@ def batched_bc_step(agent: BCAgent, obs_b, act_b, masks) -> float:
     loss = ((y - act_b) ** 2).mean(dim=(1, 2)).mean()  # mean over segments
     agent.opt.zero_grad()
     loss.backward()
-    agent.opt.step()
+    agent.step_optimizer(masks)
+    agent.inference.record_masks(masks)
     return float(loss.item())
 
 def build_batches(segments, batch_size: int, mode: str) -> list[list[int]]:
@@ -224,7 +224,7 @@ def train_par_segments(cfg: ParSegmentBCConfig):
 def _train_envs(cfg, envs):
     obs_dim, act_dim = envs[0].obs_dim, envs[0].act_dim
 
-    print("Generating / loading expert trajectories...")
+    print("Loading shared expert trajectories...")
     trajs = generate_or_load_trajectories(envs, cfg)
 
     flat = {
@@ -291,6 +291,9 @@ def _train_envs(cfg, envs):
         act_b = torch.stack([traj_tensors[segments[i][0]][1][segments[i][1]:segments[i][2]] for i in bidx])
         return obs_b, act_b
 
+    if model_name(cfg) != 'ftn' or reactive_enabled(cfg):
+        agent.inference.init_segments(n_seg)
+
     # Keep every segment's last committed mask, bit-packed on CPU for export.
     learned_masks = np.zeros((n_seg, (cfg.ftn_hidden_size + 7) // 8), dtype=np.uint8)
     losses = []
@@ -305,7 +308,7 @@ def _train_envs(cfg, envs):
             batch_loss, l0, l1 = 0.0, 0.0, 0.0
             for _ in range(cfg.segment_cycles):
                 init = logits if cfg.mask_warm_start else None
-                masks, logits, l0, l1 = batched_reconfig(agent, obs_b, act_b, cfg, init)
+                masks, logits, l0, l1 = batched_reconfig(agent, obs_b, act_b, cfg, init, segment_ids=bidx)
                 for _ in range(cfg.segment_bc_steps):
                     batch_loss = batched_bc_step(agent, obs_b, act_b, masks)
             if epoch == cfg.segment_epochs - 1:

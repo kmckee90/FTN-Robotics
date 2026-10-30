@@ -1,10 +1,12 @@
-"""MetaWorld environments and automatically cached scripted-expert demonstrations."""
+"""MetaWorld environments and shared, episode-indexed expert demonstrations."""
 from __future__ import annotations
-import os
+from pathlib import Path
 import metaworld
 import numpy as np
 import torch
-from metaworld.policies import ENV_POLICY_MAP
+
+DEFAULT_DATA_DIR = "/home/dev/ftn_data/mt50_experts"
+DATA_VERSION = 1
 
 class StandardTaskEnv:
     """One MT10 env class + its 50 goal variants. Standard reset (random goal
@@ -66,36 +68,50 @@ def _rollout_expert(env: StandardTaskEnv, policy, cfg):
         success,
     )
 
+def dataset_path(cfg, name):
+    root = Path(cfg.data_dir).expanduser().resolve()
+    workspace = Path(__file__).resolve().parent
+    if root == workspace or workspace in root.parents:
+        raise ValueError("Expert data must live outside the synced repository; use " + DEFAULT_DATA_DIR)
+    return root / f"mt50_v{DATA_VERSION}_s{cfg.seed}_t{cfg.demo_tail}_m{cfg.demo_max_steps}" / f"{name}.npz"
+
+
+def load_expert_task(cfg, name):
+    """Read a prefix of the canonical MT50 episodes; never generate during training."""
+    path = dataset_path(cfg, name)
+    hint = (f"Run on the pod: python generate_expert_data.py --data-dir {cfg.data_dir} "
+            f"--seed {cfg.seed} --n-demos {max(250, cfg.n_demos)} "
+            f"--demo-tail {cfg.demo_tail} --demo-max-steps {cfg.demo_max_steps}")
+    if not path.exists():
+        raise FileNotFoundError(f"Missing shared expert data: {path}. {hint}")
+    with np.load(path, allow_pickle=False) as archive:
+        data = {key: archive[key] for key in archive.files}
+    lengths = data.get("lengths", np.array([]))
+    if (data.get("version") != DATA_VERSION or data.get("benchmark") != "MT50"
+            or data.get("task") != name or data.get("seed") != cfg.seed
+            or data.get("demo_tail") != cfg.demo_tail
+            or data.get("demo_max_steps") != cfg.demo_max_steps
+            or lengths.ndim != 1 or lengths.dtype.kind not in "iu"
+            or len(lengths) == 0 or np.any(lengths <= 0)
+            or np.any(lengths > cfg.demo_max_steps)
+            or "obs" not in data or "act" not in data
+            or data["obs"].ndim != 2 or data["act"].ndim != 2
+            or lengths.sum() != len(data["obs"]) or lengths.sum() != len(data["act"])
+            or data.get("success", np.array([])).shape != lengths.shape):
+        raise ValueError(f"Invalid shared trajectory archive: {path}")
+    if len(lengths) < cfg.n_demos:
+        raise ValueError(f"{path} has {len(lengths)} episodes, need {cfg.n_demos}. {hint}")
+    lengths = lengths[:cfg.n_demos]
+    end = int(lengths.sum())
+    print(f"  [shared] {name:25s} {len(lengths)} trajectories ({end} transitions)")
+    return {"obs": data["obs"][:end], "act": data["act"][:end],
+            "lengths": lengths, "success": data["success"][:cfg.n_demos]}
+
+
 def generate_or_load_demos(envs, cfg) -> dict[str, dict]:
-    """Per task: a cached dict {obs:[N,D], act:[N,A]} of concatenated expert
-    transitions. Cache key includes the demo-generation params + seed so the
-    four baselines reuse identical data."""
-    os.makedirs(cfg.data_dir, exist_ok=True)
-    demos: dict[str, dict] = {}
-    for env in envs:
-        key = f"{env.name}_n{cfg.n_demos}_s{cfg.seed}_t{cfg.demo_tail}_m{cfg.demo_max_steps}.npz"
-        path = os.path.join(cfg.data_dir, key)
-        if os.path.exists(path):
-            d = np.load(path)
-            demos[env.name] = {"obs": d["obs"], "act": d["act"]}
-            print(f"  [cache] {env.name:25s} {d['obs'].shape[0]} transitions")
-            continue
-        policy = ENV_POLICY_MAP[env.name]()
-        obs_all, act_all, n_succ = [], [], 0
-        for _ in range(cfg.n_demos):
-            o, a, s = _rollout_expert(env, policy, cfg)
-            obs_all.append(o)
-            act_all.append(a)
-            n_succ += s
-        obs_cat = np.concatenate(obs_all, axis=0)
-        act_cat = np.concatenate(act_all, axis=0)
-        np.savez(path, obs=obs_cat, act=act_cat)
-        demos[env.name] = {"obs": obs_cat, "act": act_cat}
-        print(
-            f"  [gen]   {env.name:25s} {obs_cat.shape[0]} transitions "
-            f"({n_succ}/{cfg.n_demos} expert demos succeeded)"
-        )
-    return demos
+    """Compatibility entry point: load flat views of the shared trajectories."""
+    return {env.name: {k: v for k, v in load_expert_task(cfg, env.name).items()
+                       if k in ("obs", "act")} for env in envs}
 
 def fit_normalizer(demos: dict[str, dict]) -> tuple[torch.Tensor, torch.Tensor]:
     """Global observation standardizer over all tasks' expert data (frozen,
@@ -116,47 +132,12 @@ def _split_by_lengths(obs_cat, act_cat, lengths):
     return trajs
 
 def generate_or_load_trajectories(envs, cfg) -> dict[str, list]:
-    """Per task: a list of (obs[T,D], act[T,A]) expert trajectories with their
-    per-episode boundaries preserved (segments need contiguous single-episode
-    windows). Cached as concatenated arrays plus a `lengths` index; the cache
-    key mirrors the flat demo cache params so the same rollouts are
-    reused, just kept un-flattened."""
-    os.makedirs(cfg.data_dir, exist_ok=True)
-    trajs: dict[str, list] = {}
+    """Load the same shared data with episode boundaries for segment training."""
+    trajectories = {}
     for env in envs:
-        key = (
-            f"traj_{env.name}_n{cfg.n_demos}_s{cfg.seed}_t{cfg.demo_tail}"
-            f"_m{cfg.demo_max_steps}.npz"
-        )
-        path = os.path.join(cfg.data_dir, key)
-        if os.path.exists(path):
-            d = np.load(path)
-            trajs[env.name] = _split_by_lengths(d["obs"], d["act"], d["lengths"])
-            n = int(d["lengths"].sum())
-            print(
-                f"  [cache] {env.name:25s} {len(d['lengths'])} trajectories "
-                f"({n} transitions)"
-            )
-            continue
-        policy = ENV_POLICY_MAP[env.name]()
-        obs_list, act_list, lengths, n_succ = [], [], [], 0
-        for _ in range(cfg.n_demos):
-            o, a, s = _rollout_expert(env, policy, cfg)
-            obs_list.append(o)
-            act_list.append(a)
-            lengths.append(o.shape[0])
-            n_succ += s
-        obs_cat = np.concatenate(obs_list, axis=0)
-        act_cat = np.concatenate(act_list, axis=0)
-        lengths = np.asarray(lengths, dtype=np.int64)
-        np.savez(path, obs=obs_cat, act=act_cat, lengths=lengths)
-        trajs[env.name] = list(zip(obs_list, act_list))
-        print(
-            f"  [gen]   {env.name:25s} {len(obs_list)} trajectories "
-            f"({obs_cat.shape[0]} transitions, "
-            f"{n_succ}/{cfg.n_demos} expert demos succeeded)"
-        )
-    return trajs
+        data = load_expert_task(cfg, env.name)
+        trajectories[env.name] = _split_by_lengths(data["obs"], data["act"], data["lengths"])
+    return trajectories
 
 def segment_windows(T: int, seg_len: int, stride: int) -> list[tuple[int, int]]:
     """(start, end) index pairs of contiguous windows of length `seg_len` over a

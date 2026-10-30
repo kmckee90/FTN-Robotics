@@ -7,7 +7,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 from bc import BCAgent, checkpoint_masks
-from ftn import mask_to_grid
+from models import mask_to_grid
 from rendering import archive_masks, raster_masks, resolve_checkpoint, MaskEMA, compose_frame
 from runtime import DEFAULT_RUN_NAMES, named_run
 from spatial_permute import spatial_permutation, _geometry

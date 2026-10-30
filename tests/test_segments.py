@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from bc import BCAgent
 from data import segment_windows
-from ftn import anneal_ste_mask_batched
+from models import anneal_ste_mask_batched
 from mt10_segment_representation import train_mt10_transitions_bc_par as segments
 
 

@@ -15,7 +15,7 @@ import torch
 from PIL import Image, ImageDraw
 from metaworld.policies import ENV_POLICY_MAP
 from bc import BCAgent, disjoint_task_mask
-from ftn import mask_to_grid
+from models import mask_to_grid
 from runtime import DEFAULT_RUN_NAMES, configure_runtime, named_run
 from spatial_permute import spatial_permutation
 
@@ -176,6 +176,10 @@ def load_agent(path, options):
     agent.set_normalizer(checkpoint["obs_mean"].to(device), checkpoint["obs_std"].to(device))
     agent.m_a = checkpoint["m_a"].to(device)
     agent.stored_m_a = {int(i): m.to(device) for i, m in checkpoint["stored_m_a"].items()}
+    if checkpoint.get("m_a_logits") is not None:
+        agent.m_a_logits = checkpoint["m_a_logits"].to(device)
+    if checkpoint.get("inference") is not None:
+        agent.inference.load_state_dict(checkpoint["inference"])
     return agent, cfg, checkpoint
 
 

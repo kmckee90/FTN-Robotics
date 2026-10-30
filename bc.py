@@ -5,7 +5,8 @@ from dataclasses import asdict
 import numpy as np
 import torch
 import torch.nn.functional as F
-from ftn import FTNActor, LateralSmoother, anneal_ste_mask, kwta
+from models import LateralSmoother, anneal_ste_mask, kwta, make_actor, model_name, reactive_enabled
+from models.search import ModelInference, frozen_actor
 
 def disjoint_task_mask(ti: int, H: int, k: int) -> torch.Tensor:
     """k-hot mask for the fixed-mask baseline: task ti owns neurons
@@ -16,14 +17,14 @@ def disjoint_task_mask(ti: int, H: int, k: int) -> torch.Tensor:
 
 class BCAgent:
     def __init__(self, obs_dim: int, act_dim: int, cfg):
+        if cfg.weight_decay != 0:
+            raise ValueError('weight_decay must be zero to preserve inactive units')
         self.cfg = cfg
         self.act_dim = act_dim
         H, k = cfg.ftn_hidden_size, cfg.ftn_k
-        self.actor = FTNActor(
-            obs_dim, act_dim, H, cfg.ftn_layers, cfg.ftn_inner_size, cfg.ftn_dropout_p
-        )
+        self.actor = make_actor(obs_dim, act_dim, cfg)
         self.opt = torch.optim.Adam(
-            self.actor.parameters(), lr=cfg.bc_lr, weight_decay=cfg.weight_decay
+            (p for p in self.actor.parameters() if p.requires_grad), lr=cfg.bc_lr, weight_decay=0
         )
         if cfg.no_mask:
             self.m_a = torch.ones(H)
@@ -44,6 +45,8 @@ class BCAgent:
             lateral_noise_sd=cfg.lateral_noise_sd,
             torus=cfg.lateral_torus,
         )
+        self.inference = ModelInference(self.actor, cfg, self.smoother)
+        self.inference.state.masks[0].copy_(self.m_a)
         # Frozen global observation normalizer (set after data generation).
         self.obs_mean: torch.Tensor | None = None
         self.obs_std: torch.Tensor | None = None
@@ -55,13 +58,30 @@ class BCAgent:
         return (obs - self.obs_mean) / self.obs_std
 
     def reset_optimizer_state(self):
-        """Per-task Adam reset: stale momentum must not keep stepping the
-        previous task's neurons once they leave the active mask."""
-        self.opt = torch.optim.Adam(
-            self.actor.parameters(),
-            lr=self.cfg.bc_lr,
-            weight_decay=self.cfg.weight_decay,
-        )
+        """Clear all weight-Adam moments and step counters after reconfiguration."""
+        self.opt.state.clear()
+
+    @torch.no_grad()
+    def step_optimizer(self, masks):
+        """Only update units used by this step's current/replay/segment masks.
+
+        Replay membership and segment batches can change without a search. Clear
+        inactive Adam moments on EVERY step as well as resetting after searches.
+        """
+        if any(group['weight_decay'] != 0 for group in self.opt.param_groups):
+            raise ValueError('weight_decay must be zero to preserve inactive units')
+        active = masks.detach().reshape(-1, self.actor.H).gt(.5).any(0)
+        for parameter, axis in self.actor.unit_parameters():
+            shape = [1] * parameter.ndim
+            shape[axis] = self.actor.H
+            inactive = (~active).reshape(shape)
+            if parameter.grad is not None:
+                parameter.grad.masked_fill_(inactive, 0)
+            state = self.opt.state.get(parameter, {})
+            for key in ('exp_avg', 'exp_avg_sq', 'max_exp_avg_sq'):
+                if key in state:
+                    state[key].masked_fill_(inactive, 0)
+        self.opt.step()
 
     @torch.no_grad()
     def act(self, obs_np: np.ndarray, mask_a: torch.Tensor | None = None) -> np.ndarray:
@@ -79,30 +99,47 @@ class BCAgent:
         steps: int | None = None,
     ):
         """Search the k-hot actor mask that minimizes BC loss on the (already
-        normalized) expert support batch via AnnealedSTE. `obs` is normalized."""
+        normalized) expert support batch using the configured model's inference.
+        Noncommitting alternative-model searches are stateless cold evaluation.
+        """
         cfg = self.cfg
+        explicit_steps = steps
         steps = cfg.reconfig_steps if steps is None else steps
         if steps < 0:
             raise ValueError("Mask reconfiguration steps must be nonnegative")
+        if model_name(cfg) != 'ftn' or reactive_enabled(cfg):
+            masks, logits, stats = self.inference.search(
+                obs.unsqueeze(0), act.unsqueeze(0), commit=commit,
+                steps=steps if not commit else explicit_steps,
+                stored=(torch.stack(list(self.stored_m_a.values())) if self.stored_m_a else None),
+            )
+            if commit:
+                if (not reactive_enabled(cfg) or (stats['steps'] > 0).any()
+                        or not torch.equal(self.m_a, masks[0])):
+                    self.reset_optimizer_state()
+                self.m_a, self.m_a_logits = masks[0], logits[0]
+            return masks[0], {key: float(stats[key].mean()) for key in ('bc_init', 'bc_final')}
         H, k = cfg.ftn_hidden_size, cfg.ftn_k
         init = self.m_a_logits if cfg.mask_warm_start else None
 
         def bc_loss(soft_m):
             return F.mse_loss(self.actor(obs, soft_m), act)
 
-        m_new, logits_new, l_init, l_final = anneal_ste_mask(
-            H,
-            k,
-            bc_loss,
-            steps,
-            cfg.reconfig_lr,
-            init_logits=init,
-            noise_scale=cfg.mask_init_noise_scale,
-        )
+        with frozen_actor(self.actor):
+            m_new, logits_new, l_init, l_final = anneal_ste_mask(
+                H,
+                k,
+                bc_loss,
+                steps,
+                cfg.reconfig_lr,
+                init_logits=init,
+                noise_scale=cfg.mask_init_noise_scale,
+            )
         # Lateral spatial smoothing: cluster the searched mask into a contiguous
         # blob on the square grid (no-op when smoothing is disabled).
         m_new = self.smoother.smooth(m_new)
         if commit:
+            self.reset_optimizer_state()
             self.m_a = m_new
             self.m_a_logits = logits_new
         return m_new, {"bc_init": l_init, "bc_final": l_final}
@@ -123,7 +160,8 @@ class BCAgent:
             total = loss if total is None else total + loss
         self.opt.zero_grad()
         total.backward()
-        self.opt.step()
+        self.step_optimizer(torch.stack([m for _, _, m in terms]))
+        self.inference.record_masks(self.m_a)
         return cur_loss_val
 
     def sample_recalled(self, archive):
@@ -271,6 +309,8 @@ def save_checkpoint(
     torch.save(
         {
             "actor": agent.actor.state_dict(),
+            "inference": agent.inference.state_dict(),
+            "m_a_logits": None if agent.m_a_logits is None else agent.m_a_logits.detach().cpu(),
             "mask_archive": checkpoint_masks(agent, cfg),
             "obs_mean": None
             if agent.obs_mean is None

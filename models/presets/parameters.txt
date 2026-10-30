@@ -1,0 +1,293 @@
+MODEL PRESET PARAMETER GLOSSARY
+
+Usage: --model-config lora.yaml (or simply --model-config lora).
+Bare names resolve inside models/presets regardless of working directory.
+Explicit relative or absolute paths also work. YAML must contain model; other
+fields are optional. Use true/false for booleans and null for an unset value.
+
+This glossary covers every field accepted by the model YAML loader. Values in
+the chosen YAML are authoritative preset values; they need not equal the Python
+ModelConfig defaults or values in another preset. Omitted fields inherit the
+experiment defaults. Precedence is experiment defaults, YAML, smoke overrides,
+then explicit CLI flags, followed by experiment constraints. The run's config.json
+records the effective configuration.
+
+Terminology: H is the total unit/atom count, k is the active count. FTN and
+BayesFTN use independent per-unit MLPs. LoRA and BayesLoRA use trainable low-rank
+atom banks around a frozen shared MLP. Bayes changes mask inference, not the
+backbone. Reconfiguration optimizes masks with actor weights frozen; behavior
+cloning (BC) optimizes actor weights under the resulting hard masks.
+
+SEARCH PATHS AND APPLICABILITY
+
+Base FTN means model: ftn with reconfig_reactive: false. It uses its original
+annealed straight-through search: Adam for scalar searches, SGD for MT10 batched
+searches. The lora_reconfig_* optimizer/algorithm options do not affect this path.
+
+LoRA, reactive FTN, and both Bayesian models use the shared inference engine.
+Non-Bayesian training in that engine uses the lora_* search controls even when
+the architecture is FTN. Bayesian training uses bayes_* controls instead.
+Noncommitting evaluation in the engine uses eval_reconfig_* cold-search controls.
+An option may be accepted in a YAML but inactive for the selected search path.
+
+MODEL AND SHARED MASK SIZE
+
+model
+  Architecture/inference choice: ftn, lora, bayesftn, or bayeslora.
+ftn_hidden_size
+  H: number of independent FTN units or LoRA atoms. Applies to all four models.
+ftn_k
+  k: number of active units/atoms in a searched mask; 1 <= k <= H. In LoRA,
+  changing k also changes adapter scaling (lora_alpha / k).
+ftn_square_dim
+  Side length of each square block in the mask grid for smoothing/visualization.
+  H must be divisible by this value squared; multiple blocks sit side by side.
+
+FTN ARCHITECTURE (ftn and bayesftn only)
+
+ftn_inner_size
+  Hidden width inside each independent unit MLP, not the number of units.
+ftn_layers
+  Number of hidden ReLU layers in each unit MLP, before its scalar output.
+ftn_dropout_p
+  Dropout probability on unit outputs before masking and the action readout.
+  Dropout is disabled during mask search and action evaluation.
+
+LoRA ARCHITECTURE (lora and bayeslora only)
+
+lora_layers
+  Number of hidden ReLU layers in the frozen-backbone MLP. An additional output
+  layer maps to actions. Zero gives a direct observation-to-action layer.
+lora_width
+  Width of each hidden layer.
+lora_rank
+  Rank of each atom's A/B factorization at each layer.
+lora_alpha
+  Adapter strength. Each layer adds (alpha / k) times the sum of active atom
+  contributions, including atom biases when enabled. This is not alpha / rank.
+lora_weight_scale
+  Frozen backbone initialization scale: Gaussian standard deviation is this
+  value divided by sqrt(input width). Zero removes the base-weight contribution.
+lora_b0_scale
+  Initial Gaussian standard deviation for B factors and optional atom biases.
+  Must be positive; nonzero initialization gives initial mask-search signal.
+lora_dropout
+  Dropout probability on inputs to the adapter branch, not the frozen base
+  branch. Disabled during mask search and action evaluation.
+lora_bias
+  Whether each atom has a trainable bias contribution at each layer. The shared
+  frozen base layers have no bias.
+
+SPATIAL MASK SMOOTHING (all architectures)
+
+lateral_steps
+  Number of grid-convolution smoothing passes after mask search. Zero disables.
+lateral_polyak
+  Retained fraction of the previous grid scores on each pass; the convolution
+  receives weight 1 - lateral_polyak. A value of 1 disables smoothing. The final
+  scores are converted back to an exactly k-active mask.
+lateral_kernel
+  Positive odd side length of the uniform neighborhood convolution kernel.
+lateral_noise_sd
+  Gaussian noise standard deviation added to each convolution's scores.
+lateral_torus
+  true wraps grid edges; false uses zero padding.
+
+GENERAL RECONFIGURATION
+
+reconfig_steps
+  Search iterations for non-Bayesian training, including reactive FTN
+  changepoints. Also the fallback evaluation budget when the caller supplies no
+  separate budget. Bayesian training uses bayes_* step budgets, although its
+  annealste noise schedule also references reconfig_steps.
+reconfig_lr
+  Mask-logit learning rate for base FTN and non-Bayesian shared-engine training.
+  This is separate from the actor-weight BC learning rate.
+mask_init_noise_scale
+  Gaussian standard deviation for fresh non-Bayesian training logits. Base FTN
+  also multiplies supplied warm-start logits by this value; the shared engine
+  copies warm-start logits without this multiplication.
+mask_warm_start
+  Reuse previous search logits where supported. MT10 passes previous cycle
+  logits when enabled. Shared-engine non-Bayesian searches also recognize
+  lora_warm_start_reconfig; changepoints still start fresh. Bayesian inference
+  instead carries its posterior through the bayes_* prior settings.
+
+NON-BAYESIAN SHARED-ENGINE SEARCH (LoRA and reactive FTN)
+
+lora_reconfig_algorithm
+  annealste: noisy hard top-k masks with straight-through gradients and annealed
+  Gaussian noise. fast: optimize a sigmoid relaxation and score hard top-k
+  candidates. Both return a hard mask selected by support loss plus any penalty.
+lora_reconfig_optimizer
+  Mask-logit optimizer: Adam, SGD, or RMSprop. Does not select the BC optimizer.
+lora_warm_start_reconfig
+  Reuse previous logits for non-changepoint searches, like mask_warm_start in
+  this path. Does not warm-start cold evaluation or Bayesian searches.
+lora_reactive_continuous_updates
+  With reactive non-Bayesian inference, continue searching between detected
+  changepoints. false holds the current mask until a changepoint.
+lora_changepoint_reconfig_steps
+  Search iterations at a LoRA changepoint. Reactive FTN uses reconfig_steps.
+lora_match_stored
+  Enable stored-mask candidate matching during annealste training searches.
+  Uses available archived task masks, or initialized segment masks in MT10.
+  Has no effect on fast, Bayesian, or cold evaluation searches.
+lora_match_stored_after
+  Iteration count before the one-time matching operation. Zero matches after
+  the first iteration; if the budget ends earlier, matching happens at the end.
+lora_match_stored_topk
+  Number of stored masks nearest by overlap to evaluate by support objective.
+  Matching introduces a stored candidate; later search candidates may beat it.
+
+SEARCH NOISE AND OVERLAP (shared-engine training only)
+
+reconfig_noise_scale
+  Multiplier on Gaussian exploration noise for annealste searches, including
+  Bayesian annealste. Does not control Gumbel sampling or base FTN search noise.
+reconfig_overlap_lambda
+  Weight of the overlap penalty added to training mask-search loss. Zero
+  disables it. Does not change BC weight-training loss or cold evaluation.
+reconfig_overlap_mode
+  bump: penalize o*(1-o), favoring either little or complete overlap.
+  gated: penalize o*sigmoid((threshold-o)/temperature).
+  seen_logits: penalize mean(logit * previously_seen_unit_indicator).
+  For bump/gated, o is overlap with the previous mask divided by its active count.
+  seen_logits instead references the union of masks recorded during BC training.
+reconfig_overlap_threshold
+  Transition point of the gated overlap penalty, in [0, 1].
+reconfig_overlap_temperature
+  Positive softness of that gate; smaller makes its transition sharper.
+
+REACTIVE / CHANGEPOINT DETECTION (all four models)
+
+reconfig_reactive
+  true enables loss-based changepoint detection. false uses scheduled inference.
+  null chooses true for Bayesian models and false for other models.
+  MT50 checks reactive inference on each BC minibatch without task-boundary
+  posterior resets. MT10 keeps independent detector/posterior state per segment.
+reconfig_reactive_sd
+  Detect when current support loss exceeds running mean + this value times
+  running standard deviation. Lower values are more sensitive. First use is
+  always treated as a changepoint.
+reconfig_reactive_ema
+  Retention coefficient in [0, 1) for running post-search loss mean/variance.
+  Larger values adapt more slowly. Detection waits ceil(1/(1-ema)) observations
+  after initialization/reset. Changepoints reset the detector baseline.
+
+BAYESIAN REGULAR UPDATES (bayesftn and bayeslora)
+
+Bayesian models update their mask posterior between changepoints as well. When
+reactive detection is disabled, all training calls use these regular settings.
+
+bayes_reconfig_steps
+  Mask-posterior optimization iterations per regular update.
+bayes_reconfig_lr
+  Adam learning rate for posterior logits in regular updates.
+bayes_reconfig_sample_size
+  Maximum transitions from each supplied support batch used for optimization.
+  null uses all. This takes the first N supplied transitions, not a new random
+  sample; it does not control the number of sampled masks.
+bayes_reconfig_take_best
+  true returns the best visited hard mask and its logits, scored by support
+  loss plus overlap penalty (excluding KL). false returns the final posterior
+  and a mask sampled/selected from it. Applies to changepoints too.
+bayes_kl_weight
+  Weight on mean Bernoulli KL between updated and prior logits. Larger values
+  discourage posterior changes. Zero removes KL regularization.
+bayes_temperature
+  Positive temperature for sigmoid probabilities/KL and Gumbel exploration.
+  Larger values flatten probabilities. Also scales annealste exploration noise.
+bayes_prior_decay
+  Multiply previous logits by this factor in [0, 1] to initialize the prior and
+  new search. One retains them; zero resets to neutral zero logits.
+bayes_stochastic_mask
+  For gumbel, true samples exactly k active units with Gumbel noise; false takes
+  deterministic top-k. Also controls final selection when take_best is false.
+bayes_sample_type
+  gumbel: exact-k Gumbel masks with sigmoid-surrogate gradients.
+  annealste: Gaussian-noisy top-k masks with sigmoid-surrogate gradients. Its
+  search noise remains active regardless of bayes_stochastic_mask; that flag
+  still controls final selection when take_best is false.
+
+BAYESIAN CHANGEPOINT UPDATES (used when reactive detection fires)
+
+bayes_changepoint_reconfig_steps
+  Iteration budget replacing bayes_reconfig_steps at a changepoint.
+bayes_changepoint_reconfig_lr
+  Posterior Adam learning rate replacing bayes_reconfig_lr at a changepoint.
+bayes_changepoint_reconfig_sample_size
+  Support transition cap replacing bayes_reconfig_sample_size; null means all.
+bayes_changepoint_kl_weight
+  KL weight at a changepoint. Zero allows an unregularized task refit.
+bayes_changepoint_temperature
+  Probability/exploration temperature at a changepoint.
+bayes_changepoint_prior_decay
+  Prior-logit retention at a changepoint. Zero forgets the previous posterior.
+bayes_changepoint_stochastic_mask
+  Stochastic selection flag at a changepoint, with the same sampling caveats as
+  bayes_stochastic_mask. Sample type and take_best remain the shared settings.
+
+COLD EVALUATION (LoRA, reactive FTN, and both Bayesian models)
+
+Evaluation in the shared engine starts from zero logits, freezes actor weights,
+and does not modify training posterior/detector state. It uses no KL or overlap
+penalty. Base nonreactive FTN instead uses its original search controls above.
+
+eval_reconfig_lr
+  Adam learning rate for cold evaluation logits.
+eval_reconfig_sample_size
+  Maximum first N supplied support transitions used by cold search; null uses all.
+eval_reconfig_temperature
+  Positive temperature for sigmoid gradients and annealed Gumbel exploration.
+eval_reconfig_restarts
+  Number of independent zero-logit searches. The best candidate wins per row;
+  total optimization work scales with restarts times the evaluation step budget.
+eval_reconfig_take_best
+  true also considers intermediate sampled masks. false compares only final
+  deterministic top-k masks from each restart.
+
+MT50 MASK BASELINES AND ARCHIVE REPLAY
+
+no_mask
+  Enable all H units and skip reconfiguration. MT10 rejects this baseline.
+fixed_mask
+  Assign disjoint fixed k-unit subsets per task instead of searching. Requires
+  number_of_tasks * k <= H. MT10 rejects this baseline.
+stored_mask
+  During MT50 evaluation, use the stored training mask for tasks already seen;
+  unseen tasks still require inference. No effect in MT10 segment training.
+  MT50 allows at most one of no_mask, fixed_mask, stored_mask.
+consolidate
+  Enable archive-based support replay during MT50 BC. Recalled transitions use
+  their own stored masks. Disabled for no_mask/fixed_mask baselines. MT10 always
+  overrides this to false; simultaneous segment co-training remains active.
+replay_max_chunks
+  Maximum eligible archived task chunks sampled per BC update. Zero disables
+  replay. MT10 always overrides this to zero.
+replay_max_tuples
+  Maximum transitions sampled per recalled chunk, not a total across chunks.
+  MT50 also uses eight times this value as its per-task archive support cap.
+rho_low
+  Exclusive lower bound on mask overlap for replay eligibility.
+rho_high
+  Inclusive upper bound on mask overlap for replay eligibility. Overlap is the
+  shared active count divided by the current mask's active count. The default
+  interval (0.2, 0.8] excludes disjoint and identical masks.
+
+EXPERIMENT SETTINGS AND OPTIMIZER GUARANTEES
+
+Task/data options, BC learning rate/batch size, training schedule, evaluation
+step budgets, output paths, and device selection belong to experiment CLI/config,
+not these YAMLs. In particular bc_lr, weight_decay, reconfig_train, reconfig_n,
+and eval_reconfig_steps are not accepted model-preset keys.
+
+Weight decay must be zero. Committed reconfiguration resets weight-Adam moments
+and step counters; evaluation and reactive calls that hold the mask do not.
+Every BC step also clears inactive gradients/moments, using the union of masks
+contributing to that step (including replay or parallel segments). All trainable
+actor parameters belong to units/atoms; LoRA's shared backbone is frozen.
+
+The reactive_low_noreplay presets enable reactive detection with SD=5, EMA=0.9,
+consolidate=false, and replay_max_chunks=0. The name is a preset label, not an
+additional algorithm switch. Consult each YAML for its architecture and budgets.

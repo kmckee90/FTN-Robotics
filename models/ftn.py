@@ -76,6 +76,17 @@ class FTNActor(nn.Module):
         z = self.dropout(z)
         return torch.tanh(self.linear(z * mask.reshape(1, -1)))
 
+    def forward_batched(self, obs, masks):
+        S, L, D = obs.shape
+        z = self.dropout(self.parallel(obs.reshape(S * L, D))).reshape(S, L, self.H)
+        return torch.tanh(self.linear(z * masks.unsqueeze(1)))
+
+    def unit_parameters(self):
+        """Parameter and axis owned by individual mask units (no shared bias)."""
+        for parameter in self.parallel.parameters():
+            yield parameter, 0
+        yield self.linear.weight, 1
+
 def kwta(x: torch.Tensor, k: int) -> torch.Tensor:
     """Binary top-k mask over a 1D tensor."""
     idx = torch.topk(x, k).indices
@@ -193,7 +204,7 @@ def anneal_ste_mask(
         m_param = nn.Parameter(noise_scale * torch.randn(H))
     else:
         m_param = nn.Parameter(noise_scale * init_logits.detach().clone())
-    opt = torch.optim.SGD([m_param], lr=lr)
+    opt = torch.optim.Adam([m_param], lr=lr)
 
     best: torch.Tensor | None = None
     lowest = float("inf")

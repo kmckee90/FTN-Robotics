@@ -13,6 +13,28 @@ import bc as mt10
 
 
 class MT50Tests(unittest.TestCase):
+    def test_num_tasks_cli_limits_saved_curriculum(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('sys.argv', ['train.py', '--artifact-root', tmp, '--num-tasks', '3']), \
+                 patch.object(mt50, 'train') as train:
+                mt50.main()
+            cfg = train.call_args.args[0]
+            self.assertEqual(cfg.tasks, mt50.DEFAULT_TASKS[:3])
+            saved = json.loads((Path(tmp) / 'mt50-continual/config.json').read_text())
+            self.assertEqual(saved['tasks'], list(mt50.DEFAULT_TASKS[:3]))
+
+    def test_num_tasks_custom_list_and_validation(self):
+        cfg = mt50.ExpertBCConfig(tasks=('push-v3', 'reach-v3'), num_tasks=1)
+        mt50.validate_config(cfg)
+        self.assertEqual(cfg.tasks, ('push-v3',))
+        cfg = mt50.ExpertBCConfig(num_tasks=100)
+        mt50.validate_config(cfg)
+        self.assertEqual(cfg.tasks, mt50.DEFAULT_TASKS)
+        for count in (0, -1):
+            with self.assertRaisesRegex(ValueError, 'num_tasks must be positive'):
+                mt50.validate_config(mt50.ExpertBCConfig(num_tasks=count))
+
     def test_prior_row_precedes_training(self):
         for module in (mt50,):
             with tempfile.TemporaryDirectory() as tmp:
